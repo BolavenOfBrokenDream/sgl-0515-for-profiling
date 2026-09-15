@@ -1,0 +1,98 @@
+From 01ad7a94f6dd64ec542056aacf88da662e418f66 Mon Sep 17 00:00:00 2001
+From: Omais <dshqwdchy@163.com>
+Date: Tue, 15 Sep 2026 18:59:21 +0800
+Subject: [PATCH] profiling: add SGLANG_NPU_GDN_MAMBA_OPT switch for GDN fused
+ split + strided recurrent (default on)
+
+---
+ .../fla/fused_sigmoid_gating_recurrent.py          | 14 ++++++++++++++
+ sglang/python/sglang/srt/environ.py                |  4 ++++
+ sglang/python/sglang/srt/models/qwen3_5.py         | 10 +++++++++-
+ 3 files changed, 27 insertions(+), 1 deletion(-)
+
+diff --git a/sgl-kernel-npu/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py b/sgl-kernel-npu/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+index c39850f..9eed9ae 100644
+--- a/sgl-kernel-npu/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
++++ b/sgl-kernel-npu/python/sgl_kernel_npu/sgl_kernel_npu/fla/fused_sigmoid_gating_recurrent.py
+@@ -1,4 +1,5 @@
+ # Adapt from https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/layers/attention/fla/fused_sigmoid_gating_recurrent.py
++import os
+ from typing import Optional
+ 
+ import torch
+@@ -6,6 +7,12 @@ import torch.nn.functional as F
+ import triton
+ import triton.language as tl
+ 
++# SGLANG_NPU_GDN_MAMBA_OPT=0 restores the old @input_guard behavior: the
++# wrapper materializes q/k/v as contiguous copies before launch instead of
++# letting the kernel read strided views directly. Read once at import time
++# (matches the capture-time freeze semantics).
++_GDN_MAMBA_OPT = os.environ.get("SGLANG_NPU_GDN_MAMBA_OPT", "1") == "1"
++
+ 
+ @triton.heuristics(
+     {
+@@ -195,6 +202,13 @@ def fused_sigmoid_gating_delta_rule_update_npu(
+     寻址，消去 decode 路径每层 3 份 q/k/v 拷贝；连续输入时寻址与原版完全一致
+     （逐 bit 等价，已由 resource/code/gdn_mamba/test_b 验证）。
+     """
++    if not _GDN_MAMBA_OPT:
++        # SGLANG_NPU_GDN_MAMBA_OPT=0: restore the old @input_guard behavior —
++        # materialize q/k/v as contiguous copies so the kernel reads packed
++        # rows (row strides become H*K / HV*V again).
++        q = q.contiguous()
++        k = k.contiguous()
++        v = v.contiguous()
+     assert q.stride(-1) == 1 and k.stride(-1) == 1 and v.stride(-1) == 1
+     assert initial_state_source.is_contiguous()
+     a = a.contiguous()
+diff --git a/sglang/python/sglang/srt/environ.py b/sglang/python/sglang/srt/environ.py
+index 0e57938..e4a7726 100644
+--- a/sglang/python/sglang/srt/environ.py
++++ b/sglang/python/sglang/srt/environ.py
+@@ -561,6 +561,10 @@ class Envs:
+     SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG = EnvBool(False)
+     # GDN decode recurrent PR#740 Triton variant switch
+     SGLANG_NPU_GDN_UPDATE_FUSED = EnvBool(False)
++    # GDN mamba opt: fused qkvzba split on NPU (qwen3_5) + strided recurrent
++    # reads (sgl_kernel_npu wrapper); 0 restores the NPU fallback split and
++    # contiguous materialization of q/k/v
++    SGLANG_NPU_GDN_MAMBA_OPT = EnvBool(True)
+     # GDN input-projection qkvz+ba weight pack into a single GEMM; MAX_M gates
+     # small M — M above the threshold falls back to two GEMMs
+     SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
+diff --git a/sglang/python/sglang/srt/models/qwen3_5.py b/sglang/python/sglang/srt/models/qwen3_5.py
+index 1e7357b..14b001c 100644
+--- a/sglang/python/sglang/srt/models/qwen3_5.py
++++ b/sglang/python/sglang/srt/models/qwen3_5.py
+@@ -150,6 +150,12 @@ _gdn_qkvzba_pack_env = get_bool_env_var("SGLANG_NPU_GDN_QKVZBA_PACK", "true")
+ # (not a multiple of the 256 tile) outweighs the saved ba GEMM.
+ _gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"))
+ 
++# GDN mamba opt (fused qkvzba split on NPU + strided recurrent reads). On by
++# default; =0 makes NPU take the old fallback (fix_query_key_value_ordering +
++# contiguous + torch.cat) and makes the sgl_kernel_npu recurrent wrapper
++# materialize q/k/v contiguously again.
++_gdn_mamba_opt_env = get_bool_env_var("SGLANG_NPU_GDN_MAMBA_OPT", "true")
++
+ cached_get_processor = lru_cache(get_processor)
+ 
+ 
+@@ -713,10 +719,12 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+ 
+         if core_attn_out is None:
+             # NPU uses the fused split kernel too (the import above is rebound per
+-            # platform to the sgl_kernel_npu version)
++            # platform to the sgl_kernel_npu version); SGLANG_NPU_GDN_MAMBA_OPT=0
++            # excludes NPU again, restoring the fallback branch below.
+             if (
+                 self.num_v_heads // self.num_k_heads in [1, 2, 4]
+                 and not _is_cpu
++                and (_gdn_mamba_opt_env or not _is_npu)
+             ):
+                 mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+                     projected_states_qkvz,
+-- 
+2.51.0.windows.1
+

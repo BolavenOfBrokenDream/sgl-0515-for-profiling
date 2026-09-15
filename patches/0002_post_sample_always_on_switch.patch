@@ -1,0 +1,156 @@
+From 950d9395ddebd25dbe3deb3c885c2259e1dfa69b Mon Sep 17 00:00:00 2001
+From: Omais <dshqwdchy@163.com>
+Date: Tue, 15 Sep 2026 18:58:30 +0800
+Subject: [PATCH] profiling: add SGLANG_NPU_POST_SAMPLE_OPT switch for
+ always-on sampler opts (default on)
+
+---
+ sglang/python/sglang/srt/environ.py        |  5 ++
+ sglang/python/sglang/srt/layers/sampler.py | 88 +++++++++++++++++-----
+ 2 files changed, 74 insertions(+), 19 deletions(-)
+
+diff --git a/sglang/python/sglang/srt/environ.py b/sglang/python/sglang/srt/environ.py
+index aec3d03..0e57938 100644
+--- a/sglang/python/sglang/srt/environ.py
++++ b/sglang/python/sglang/srt/environ.py
+@@ -573,6 +573,11 @@ class Envs:
+     # EXP_RACE_TRITON enables its fused Triton consumer kernel
+     SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
+     SGLANG_NPU_EXP_RACE_TRITON = EnvBool(True)
++    # post_sample always-on small-op eliminations in the standard sampling
++    # path (T==1 RealDiv skip / no softmax write-back / deferred log / clamp
++    # after extraction / gather-based sampled-token logprob); 0 restores the
++    # original implementations
++    SGLANG_NPU_POST_SAMPLE_OPT = EnvBool(True)
+     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+     # MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
+     # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias
+diff --git a/sglang/python/sglang/srt/layers/sampler.py b/sglang/python/sglang/srt/layers/sampler.py
+index 3bf9545..74a6709 100644
+--- a/sglang/python/sglang/srt/layers/sampler.py
++++ b/sglang/python/sglang/srt/layers/sampler.py
+@@ -6,6 +6,7 @@ import torch.distributed as dist
+ from torch import nn
+ 
+ from sglang.srt.distributed import get_tp_group
++from sglang.srt.environ import envs
+ from sglang.srt.layers.dp_attention import (
+     get_attention_tp_group,
+     is_dp_attention_enabled,
+@@ -81,6 +82,13 @@ logger = logging.getLogger(__name__)
+ 
+ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
++
++# post_sample always-on small-op eliminations (skip RealDiv when every
++# temperature is 1.0, no softmax write-back, deferred log on extracted
++# tensors, clamp after extraction, gather-based sampled-token logprob);
++# 0 restores the original implementations. Read once at import time —
++# Sampler.forward runs every step.
++_post_sample_opt = envs.SGLANG_NPU_POST_SAMPLE_OPT.get()
+ _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
+ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
+ 
+@@ -447,31 +455,41 @@ class Sampler(nn.Module):
+                     logprobs = logprobs_via_logsoftmax_kernel
+             else:
+                 # Standard path: do softmax and sample from probs.
+-                # All temperature == 1.0 makes div_ an IEEE bitwise identity
+-                # (x/1.0 == x), so skip the RealDiv. The flag is maintained
+-                # host-side by SamplingBatchInfo; older versions without the
+-                # field default to False (no skip) via getattr.
+-                if not getattr(sampling_info, "temperatures_all_one", False):
++                if _post_sample_opt:
++                    # All temperature == 1.0 makes div_ an IEEE bitwise
++                    # identity (x/1.0 == x), so skip the RealDiv. The flag is
++                    # maintained host-side by SamplingBatchInfo; older
++                    # versions without the field default to False (no skip)
++                    # via getattr.
++                    if not getattr(sampling_info, "temperatures_all_one", False):
++                        logits.div_(sampling_info.temperatures)
++
++                    # Do not write the softmax output back into logits: the
++                    # write-back costs a full-matrix TensorMove pass (~0.2 ms
++                    # on NPU at bs=128 x vocab=248320 fp32). logits (now x/T)
++                    # is not read again on this path and is overwritten by the
++                    # next forward anyway. Trade-off: one extra live
++                    # [batch, vocab] fp32 tensor during sampling.
++                    probs = torch.softmax(logits, dim=-1)
++                else:
+                     logits.div_(sampling_info.temperatures)
+-
+-                # Do not write the softmax output back into logits: the
+-                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
+-                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
+-                # read again on this path and is overwritten by the next
+-                # forward anyway. Trade-off: one extra live [batch, vocab]
+-                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
+-                probs = torch.softmax(logits, dim=-1)
++                    # In-place op to save memory
++                    logits[:] = torch.softmax(logits, dim=-1)
++                    probs = logits
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+                 )
+                 if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+-                    logprobs = (
+-                        logprobs_via_logsoftmax_kernel
+-                        if logprobs_via_logsoftmax_kernel is not None
+-                        else probs
+-                    )
+-                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
++                    if logprobs_via_logsoftmax_kernel is not None:
++                        logprobs = logprobs_via_logsoftmax_kernel
++                    elif _post_sample_opt:
++                        # Reuse probs as-is; the log is deferred to the small
++                        # extracted tensors in _attach_logprobs_to_output.
++                        logprobs = probs
++                        logprobs_are_probs = True
++                    else:
++                        logprobs = torch.log(probs)
+                 del probs
+ 
+         # Attach logprobs to logits_output (in-place modification)
+@@ -641,6 +659,38 @@ class Sampler(nn.Module):
+         batch_next_token_ids: torch.Tensor,
+         logprobs_are_probs: bool,
+     ):
++        if not _post_sample_opt:
++            # Original implementation: clamp the full [batch, vocab] matrix
++            # up front and extract the sampled-token logprobs via arange +
++            # 2-D advanced indexing.
++            # clamp to avoid -inf values
++            logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++
++            # Attach logprobs to logits_output (in-place modification)
++            if any(x > 0 for x in top_logprobs_nums):
++                (
++                    logits_output.next_token_top_logprobs_val,
++                    logits_output.next_token_top_logprobs_idx,
++                ) = get_top_logprobs(
++                    logprobs, top_logprobs_nums, no_copy_to_cpu=True
++                )
++
++            if any(x is not None for x in token_ids_logprobs):
++                (
++                    logits_output.next_token_token_ids_logprobs_val,
++                    logits_output.next_token_token_ids_logprobs_idx,
++                ) = get_token_ids_logprobs(
++                    logprobs, token_ids_logprobs, no_copy_to_cpu=True
++                )
++
++            logits_output.next_token_logprobs = logprobs[
++                torch.arange(
++                    len(batch_next_token_ids), device=sampling_info.device
++                ),
++                batch_next_token_ids,
++            ]
++            return
++
+         # Clamp the extracted values instead of the full [batch, vocab]
+         # matrix. clamp(min=const) is elementwise and monotone
+         # non-decreasing, so it commutes with topk/gather: clamping the
+-- 
+2.51.0.windows.1
+

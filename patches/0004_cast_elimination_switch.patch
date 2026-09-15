@@ -1,0 +1,278 @@
+From 382e2b403a98559f5e00e3213a586babbcdc221d Mon Sep 17 00:00:00 2001
+From: Omais <dshqwdchy@163.com>
+Date: Tue, 15 Sep 2026 19:00:45 +0800
+Subject: [PATCH] profiling: add SGLANG_NPU_CAST_ELIMINATION switch for
+ decode-graph cast elimination (default on)
+
+---
+ sglang/python/sglang/srt/environ.py           |  4 +
+ .../ascend_hybrid_linear_attn_backend.py      | 88 ++++++++++++-------
+ .../srt/hardware_backend/npu/moe/topk.py      | 27 ++++--
+ sglang/python/sglang/srt/models/qwen3_5.py    | 19 ++--
+ 4 files changed, 93 insertions(+), 45 deletions(-)
+
+diff --git a/sglang/python/sglang/srt/environ.py b/sglang/python/sglang/srt/environ.py
+index e4a7726..d47aac2 100644
+--- a/sglang/python/sglang/srt/environ.py
++++ b/sglang/python/sglang/srt/environ.py
+@@ -583,6 +583,10 @@ class Envs:
+     # original implementations
+     SGLANG_NPU_POST_SAMPLE_OPT = EnvBool(True)
+     SGLANG_NPU_USE_MLAPO = EnvBool(False)
++    # Decode-graph cast elimination: int64 graph metadata + int32 shadow
++    # buffers for the GDN recurrent, bf16 direct feed in the MoE front_fusion
++    # top-k, fp32 dt_bias; 0 restores the original dtypes/casts
++    SGLANG_NPU_CAST_ELIMINATION = EnvBool(True)
+     # MoE 前段融合包（moe_front_fusion/v1，合入自 daikang 分支）总开关：
+     # renorm=1 单算子路由 + v2.2 自写 init_routing，仅作用于无 group/无 bias
+     # 的 BF16 路径。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
+diff --git a/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py b/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+index 2149c9e..abf84dc 100644
+--- a/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
++++ b/sglang/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+@@ -7,6 +7,7 @@ from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+     move_intermediate_cache,
+ )
+ 
++from sglang.srt.environ import envs
+ from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+     HybridLinearAttnBackend,
+@@ -22,35 +23,49 @@ from sglang.srt.speculative.spec_info import SpecInput
+ 
+ logger = logging.getLogger(__name__)
+ 
++# SGLANG_NPU_CAST_ELIMINATION (default on): int64 decode-graph metadata +
++# int32 shadow buffers for the recurrent side. 0 restores the original int32
++# metadata and disables the shadow machinery. Read once at import time (the
++# dtype choice is baked into the graphs at capture).
++_cast_elimination = envs.SGLANG_NPU_CAST_ELIMINATION.get()
++
+ 
+ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+     def __init__(self, model_runner: ModelRunner):
+         super().__init__(model_runner)
+         self.state_indices_list_gdn = []
+-        # decode int32 shadow buffers: the AscendC recurrent host reads
+-        # cache_indices/cu_seqlens as int32_t*; synced once per step outside
+-        # the decode graph (zero cast inside the graph); always None on the
+-        # eager/verify paths.
+-        self.decode_state_indices_i32_list = []
+-        self.decode_query_start_loc_i32_list = []
+-        self.cached_cuda_graph_decode_query_start_loc_i32 = None
++        # Always None unless the decode-graph shadow sync sets it (eager and
++        # verify paths leave it None); consumed by ascend_gdn_backend.py.
+         self._decode_recurrent_shadow_i32 = None
++        if _cast_elimination:
++            # decode int32 shadow buffers: the AscendC recurrent host reads
++            # cache_indices/cu_seqlens as int32_t*; synced once per step outside
++            # the decode graph (zero cast inside the graph); always None on the
++            # eager/verify paths.
++            self.decode_state_indices_i32_list = []
++            self.decode_query_start_loc_i32_list = []
++            self.cached_cuda_graph_decode_query_start_loc_i32 = None
+ 
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         assert (
+             max_num_tokens % max_bs == 0
+         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+         draft_token_num = max_num_tokens // max_bs
+-        # state_indices / query_start_loc primary buffers use int64: the conv
+-        # AscendC ops (causal_conv1d / fused_qkvzba_conv1d) read them as
+-        # int64_t* on host, so feeding directly avoids an in-graph cast.
+-        # Exception: state_indices_list_gdn stays int32 (recurrent_gated_delta_rule
+-        # reads it as int32_t* without validation — changing it silently
+-        # corrupts results).
++        # With cast elimination on, state_indices / query_start_loc primary
++        # buffers use int64: the conv AscendC ops (causal_conv1d /
++        # fused_qkvzba_conv1d) read them as int64_t* on host, so feeding
++        # directly avoids an in-graph cast. Off restores the original int32
++        # metadata. Exception either way: state_indices_list_gdn stays int32
++        # (recurrent_gated_delta_rule reads it as int32_t* without validation —
++        # changing it silently corrupts results).
++        metadata_dtype = torch.int64 if _cast_elimination else torch.int32
+         for i in range(max_bs):
+             self.state_indices_list.append(
+                 torch.full(
+-                    (i + 1,), self.pad_slot_id, dtype=torch.int64, device=self.device
++                    (i + 1,),
++                    self.pad_slot_id,
++                    dtype=metadata_dtype,
++                    device=self.device,
+                 )
+             )
+             self.state_indices_list_gdn.append(
+@@ -62,7 +77,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 )
+             )
+             self.query_start_loc_list.append(
+-                torch.zeros((i + 2,), dtype=torch.int64, device=self.device)
++                torch.zeros((i + 2,), dtype=metadata_dtype, device=self.device)
+             )
+             self.retrieve_next_token_list.append(
+                 torch.zeros(
+@@ -79,29 +94,32 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                 )
+             )
+-            # decode shadow buffers (recurrent side), synced outside the graph
+-            # by _capture/_replay_metadata each step; not used in verify.
+-            self.decode_state_indices_i32_list.append(
+-                torch.full(
+-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++            if _cast_elimination:
++                # decode shadow buffers (recurrent side), synced outside the
++                # graph by _capture/_replay_metadata each step; not used in
++                # verify.
++                self.decode_state_indices_i32_list.append(
++                    torch.full(
++                        (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++                    )
++                )
++                self.decode_query_start_loc_i32_list.append(
++                    torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+                 )
+-            )
+-            self.decode_query_start_loc_i32_list.append(
+-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
+-            )
+         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+-            0, max_bs + 1, dtype=torch.int64, device=self.device
+-        )
+-        # decode query_start_loc is a static arange — the int32 copy is built
+-        # once at init, so shadow sync is just a same-dtype copy.
+-        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
+-            0, max_bs + 1, dtype=torch.int32, device=self.device
++            0, max_bs + 1, dtype=metadata_dtype, device=self.device
+         )
++        if _cast_elimination:
++            # decode query_start_loc is a static arange — the int32 copy is
++            # built once at init, so shadow sync is just a same-dtype copy.
++            self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
++                0, max_bs + 1, dtype=torch.int32, device=self.device
++            )
+         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+             0,
+             max_bs * draft_token_num + 1,
+             step=draft_token_num,
+-            dtype=torch.int64,
++            dtype=metadata_dtype,
+             device=self.device,
+         )
+ 
+@@ -140,7 +158,8 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+             self.query_start_loc_list[bs - 1].copy_(
+                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+             )
+-            self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
++            if _cast_elimination:
++                self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
+         elif forward_mode.is_target_verify():
+             self._decode_recurrent_shadow_i32 = None
+             self.query_start_loc_list[bs - 1].copy_(
+@@ -216,7 +235,10 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
+                     bs - num_padding
+                 )
+-            self._update_decode_recurrent_shadow_i32(bs, mamba_indices, num_padding)
++            if _cast_elimination:
++                self._update_decode_recurrent_shadow_i32(
++                    bs, mamba_indices, num_padding
++                )
+         elif forward_mode.is_target_verify():
+             self._decode_recurrent_shadow_i32 = None
+             ssm_state_indices = torch.arange(
+diff --git a/sglang/python/sglang/srt/hardware_backend/npu/moe/topk.py b/sglang/python/sglang/srt/hardware_backend/npu/moe/topk.py
+index 1d4759c..cf83501 100644
+--- a/sglang/python/sglang/srt/hardware_backend/npu/moe/topk.py
++++ b/sglang/python/sglang/srt/hardware_backend/npu/moe/topk.py
+@@ -21,6 +21,11 @@ if TYPE_CHECKING:
+ # SGLANG_MOE_FRONT_FUSION=1。仅作用于下方 fast path（无 group/无 bias）。
+ _moe_front_fusion = envs.SGLANG_MOE_FRONT_FUSION.get()
+ 
++# SGLANG_NPU_CAST_ELIMINATION (default on): feed bf16 router_logits directly
++# to the front_fusion top-k and skip the output fp32 cast. 0 restores the
++# original host-side fp32 conversion on both sides.
++_cast_elimination = envs.SGLANG_NPU_CAST_ELIMINATION.get()
++
+ 
+ def fused_topk_npu(
+     hidden_states: torch.Tensor,
+@@ -43,14 +48,20 @@ def fused_topk_npu(
+             and topk_config.num_fused_shared_experts == 0
+         ):
+             # renorm=1 single op = gating_top_k_softmax + l1_norm.
+-            # Feed bf16 directly: aclnnMoeGatingTopK supports BF16 input and
+-            # computes softmax in fp32 after exact widening, so ids are
+-            # bitwise unchanged; no .to(fp32) on the output (with bf16 output
+-            # that would be a real cast). The deepep path's fp32 contract for
+-            # topk_weights is restored by the defensive .to(fp32) before the
+-            # two dispatch_a call sites in deepep.py.
++            # With cast elimination on, feed bf16 directly:
++            # aclnnMoeGatingTopK supports BF16 input and computes softmax in
++            # fp32 after exact widening, so ids are bitwise unchanged; no
++            # .to(fp32) on the output (with bf16 output that would be a real
++            # cast). The deepep path's fp32 contract for topk_weights is
++            # restored by the defensive .to(fp32) before the two dispatch_a
++            # call sites in deepep.py. Off restores the original host-side
++            # fp32 conversion on input and output.
+             topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
+-                router_logits,
++                (
++                    router_logits
++                    if _cast_elimination
++                    else router_logits.to(torch.float32)
++                ),
+                 k=topk_config.top_k,
+                 bias=None,
+                 k_group=1,
+@@ -61,6 +72,8 @@ def fused_topk_npu(
+                 routed_scaling_factor=1.0,
+                 eps=float(1e-20),
+             )
++            if not _cast_elimination:
++                topk_weights = topk_weights.to(torch.float32)
+         else:
+             topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+                 router_logits,
+diff --git a/sglang/python/sglang/srt/models/qwen3_5.py b/sglang/python/sglang/srt/models/qwen3_5.py
+index 14b001c..009537e 100644
+--- a/sglang/python/sglang/srt/models/qwen3_5.py
++++ b/sglang/python/sglang/srt/models/qwen3_5.py
+@@ -156,6 +156,10 @@ _gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"
+ # materialize q/k/v contiguously again.
+ _gdn_mamba_opt_env = get_bool_env_var("SGLANG_NPU_GDN_MAMBA_OPT", "true")
+ 
++# Decode-graph cast elimination (dt_bias fp32 at the source). On by default;
++# =0 restores the default dtype for dt_bias.
++_cast_elimination_env = get_bool_env_var("SGLANG_NPU_CAST_ELIMINATION", "true")
++
+ cached_get_processor = lru_cache(get_processor)
+ 
+ 
+@@ -358,12 +362,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         self._packed_qkvzba_weight: Optional[torch.Tensor] = None
+ 
+         # State parameters
+-        # dt_bias is materialized in fp32 like A_log: gating/recurrent kernels widen
+-        # to fp32 losslessly anyway and the AscendC recurrent host requires fp32, so
+-        # with fp32 at the source the wrapper's .float() becomes a no-op. Loading and
+-        # RL weight sync are copy_-based (implicit cast), same as A_log.
++        # With cast elimination on, dt_bias is materialized in fp32 like A_log:
++        # gating/recurrent kernels widen to fp32 losslessly anyway and the
++        # AscendC recurrent host requires fp32, so with fp32 at the source the
++        # wrapper's .float() becomes a no-op. Loading and RL weight sync are
++        # copy_-based (implicit cast), same as A_log. Off restores the default
++        # model dtype (bf16).
+         self.dt_bias = nn.Parameter(
+-            torch.ones(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
++            torch.ones(
++                self.num_v_heads // self.attn_tp_size,
++                dtype=torch.float32 if _cast_elimination_env else None,
++            ),
+         )
+         self.A_log = nn.Parameter(
+             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+-- 
+2.51.0.windows.1
+

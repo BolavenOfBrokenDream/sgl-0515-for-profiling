@@ -1,0 +1,54 @@
+From 0d2df90a7e143dc8bf608afe9cd8942bb44f8d2f Mon Sep 17 00:00:00 2001
+From: Omais <dshqwdchy@163.com>
+Date: Tue, 15 Sep 2026 18:57:48 +0800
+Subject: [PATCH] profiling: add SGLANG_NPU_MROPE_FASTPATH switch for mrope
+ fast path (default on)
+
+---
+ sglang/python/sglang/srt/environ.py                        | 4 ++++
+ .../python/sglang/srt/model_executor/forward_batch_info.py | 7 ++++++-
+ 2 files changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/sglang/python/sglang/srt/environ.py b/sglang/python/sglang/srt/environ.py
+index 8603b2b..aec3d03 100644
+--- a/sglang/python/sglang/srt/environ.py
++++ b/sglang/python/sglang/srt/environ.py
+@@ -565,6 +565,10 @@ class Envs:
+     # small M — M above the threshold falls back to two GEMMs
+     SGLANG_NPU_GDN_QKVZBA_PACK = EnvBool(True)
+     SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M = EnvInt(256)
++    # mRoPE device-positions fast path for text-only batches (reuse device-side
++    # self.positions, skip the per-request host construction + H2D copy);
++    # 0 falls back to the original host-side per-request loop
++    SGLANG_NPU_MROPE_FASTPATH = EnvBool(True)
+     # post_sample: async exponential-race sampling (910C only);
+     # EXP_RACE_TRITON enables its fused Triton consumer kernel
+     SGLANG_NPU_ASYNC_EXPONENTIAL = EnvBool(False)
+diff --git a/sglang/python/sglang/srt/model_executor/forward_batch_info.py b/sglang/python/sglang/srt/model_executor/forward_batch_info.py
+index bbfde63..3e11caa 100644
+--- a/sglang/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/sglang/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -74,6 +74,10 @@ _skip_attn_backend_init_warned = False
+ 
+ _is_npu = is_npu()
+ 
++# NPU mRoPE device-positions fast path (SGLANG_NPU_MROPE_FASTPATH, default
++# on); read once at import time — _compute_mrope_positions runs every step.
++_mrope_fastpath_enabled = envs.SGLANG_NPU_MROPE_FASTPATH.get()
++
+ 
+ class ForwardMode(IntEnum):
+     # Extend a sequence. The KV cache of the beginning part of the sequence is already computed (e.g., system prompt).
+@@ -1057,7 +1061,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         rl_on_policy_target = get_server_args().rl_on_policy_target
+ 
+         if (
+-            self.spec_info is None
++            _mrope_fastpath_enabled
++            and self.spec_info is None
+             and batch.dllm_config is None
+             and (
+                 rl_on_policy_target is not None
+-- 
+2.51.0.windows.1
+
