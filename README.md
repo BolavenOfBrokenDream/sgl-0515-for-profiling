@@ -12,7 +12,7 @@ Qwen3.5-9B（dense）与 Qwen3.5-35B-A3B（MoE，GDN 线性注意力 + 全注意
 
 ```
 patches/                  # 基于 0515 main@6bcca68 的开关补丁（git apply 按序套用）
-scripts/                  # 服务器侧脚本：开关集中定义、A/B 实验、decode 压测、profiling 采集
+scripts/                  # 服务器侧脚本：开关集中定义、A/B 实验、decode 压测、profiling 采集、rollout 日志指标提取
 docs/
   switch-matrix.md        # 14 点 × 开关 × 默认值 × 生效条件 总表
   experiment-plan.md      # 实验顺序（0517 上仓顺序）、A/B 协议、profiling 协议
