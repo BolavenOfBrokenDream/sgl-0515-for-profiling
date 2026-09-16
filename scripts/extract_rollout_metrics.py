@@ -6,7 +6,8 @@
 1. rollout_time_avg_s
    每 rollout step 打印一次的完成行：
      Rollout 0 generation: 100%|██████████| 64/64 [03:18<00:00,  3.11s/it]
-   取其中的耗时（03:18 -> 198s）。step 0 偏长不计，取 step 1..last 的平均。
+   取其中的耗时（03:18 -> 198s）。step 0 偏长不计，取 step 1..last 的平均；
+   可用 --trim-rollout-top N 再剔除耗时最大的 N 个 step。
 
 2. max_gen_throughput_tok_s
    仅 Decode batch 行的 "gen throughput (token/s)"（Prefill 不计）。按引擎区分
@@ -105,13 +106,18 @@ def parse_log(path: Path):
     return step_times, max_tps, step_ft, pids
 
 
-def metrics_for(path: Path):
+def metrics_for(path: Path, trim_rollout_top: int = 0):
     step_times, max_tps, step_ft, pids = parse_log(path)
 
     steps = sorted(s for s in step_times if s >= 1)
+    # rollout time 平均前，剔除耗时最大的 trim_rollout_top 个 step（只影响指标 1）
+    steps_used = sorted(steps, key=lambda s: step_times[s])[: len(steps) - trim_rollout_top]
     rollout_avg = None
-    if steps:
-        rollout_avg = sum(step_times[s] for s in steps) / len(steps)
+    if steps_used:
+        rollout_avg = sum(step_times[s] for s in steps_used) / len(steps_used)
+    elif steps:
+        print(f"WARN: {path.name} trim_rollout_top={trim_rollout_top} >= 可用 step 数 "
+              f"{len(steps)}，rollout_time_avg_s 置空", file=sys.stderr)
 
     max_gen = sum(max_tps.values()) if max_tps else None
 
@@ -126,7 +132,7 @@ def metrics_for(path: Path):
          sum(step_ft[s].values()) / step_times[s] if s in step_ft else None)
         for s in steps
     ]
-    return rollout_avg, max_gen, total_gen, len(steps), len(pids), per_step
+    return rollout_avg, max_gen, total_gen, len(steps_used), len(pids), per_step
 
 
 def main():
@@ -137,6 +143,9 @@ def main():
     ap.add_argument("--glob", default="*.log", help="日志文件 glob（默认 *.log）")
     ap.add_argument("--per-step", action="store_true",
                     help="附带输出每 step 明细 csv（<out>.per_step.csv）")
+    ap.add_argument("--trim-rollout-top", type=int, default=0, metavar="N",
+                    help="计算 rollout_time_avg_s 前剔除耗时最大的 N 个 step（默认 0；"
+                         "只影响指标 1，total_gen_throughput 仍用全部 step）")
     args = ap.parse_args()
 
     log_dir = Path(args.log_dir)
@@ -164,9 +173,10 @@ def main():
 
     for i, p in enumerate(files):
         name = EXPERIMENT_NAMES[i] if i < len(EXPERIMENT_NAMES) else f"exp_{i:02d}"
-        rollout_avg, max_gen, total_gen, n_steps, n_eng, per_step = metrics_for(p)
-        if n_steps == 0:
-            print(f"WARN: {p.name} 未解析到 rollout step 完成行", file=sys.stderr)
+        rollout_avg, max_gen, total_gen, n_steps, n_eng, per_step = metrics_for(
+            p, trim_rollout_top=args.trim_rollout_top)
+        if rollout_avg is None:
+            print(f"WARN: {p.name} 未解析到可用 rollout step 完成行", file=sys.stderr)
         if max_gen is None:
             print(f"WARN: {p.name} 未解析到 Decode batch 行", file=sys.stderr)
         fmt = lambda v: "" if v is None else f"{v:.2f}"
@@ -177,7 +187,8 @@ def main():
                                   "" if tg is None else f"{tg:.2f}"])
 
     with open(out, "w", encoding="utf-8", newline="") as f:
-        f.write(f"# rollout metrics comparison, dir={log_dir}, ordered by filename timestamp\n")
+        f.write(f"# rollout metrics comparison, dir={log_dir}, ordered by filename timestamp, "
+                f"trim_rollout_top={args.trim_rollout_top}\n")
         f.write(",".join(header) + "\n")
         for r in rows:
             f.write(",".join(str(x) for x in r) + "\n")
