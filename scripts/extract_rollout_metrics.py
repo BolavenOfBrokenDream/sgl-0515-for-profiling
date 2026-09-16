@@ -18,6 +18,7 @@
    每个 rollout step（>=1）内：各引擎 "Decode batch" 行的 #full token 最大值跨引擎
    求和（先每引擎取 max 再相加），除以该 step 的 rollout time（s）；取各 step 平均。
    step 归属：Rollout N 完成行打印于 step N 末尾，其后的 decode 行属于 step N+1。
+   --trim-rollout-top N 剔除耗时最大的 N 个 step 同样作用于本指标与指标 1。
 
 实验顺序：按文件名中的时间戳（非 mtime）升序，最早 = 00_baseline，依次对应
 14 组实验（00_baseline .. 13_moe_tail_fusion）。
@@ -110,19 +111,20 @@ def metrics_for(path: Path, trim_rollout_top: int = 0):
     step_times, max_tps, step_ft, pids = parse_log(path)
 
     steps = sorted(s for s in step_times if s >= 1)
-    # rollout time 平均前，剔除耗时最大的 trim_rollout_top 个 step（只影响指标 1）
+    # 剔除耗时最大的 trim_rollout_top 个 step，指标 1 与指标 3 都只用剩余 step
     steps_used = sorted(steps, key=lambda s: step_times[s])[: len(steps) - trim_rollout_top]
     rollout_avg = None
     if steps_used:
         rollout_avg = sum(step_times[s] for s in steps_used) / len(steps_used)
     elif steps:
         print(f"WARN: {path.name} trim_rollout_top={trim_rollout_top} >= 可用 step 数 "
-              f"{len(steps)}，rollout_time_avg_s 置空", file=sys.stderr)
+              f"{len(steps)}，rollout_time_avg_s / total_gen_throughput_tok_s 置空",
+              file=sys.stderr)
 
     max_gen = sum(max_tps.values()) if max_tps else None
 
     totals = []
-    for s in steps:
+    for s in steps_used:
         if s in step_ft and s in step_times:
             totals.append(sum(step_ft[s].values()) / step_times[s])
     total_gen = sum(totals) / len(totals) if totals else None
@@ -144,8 +146,8 @@ def main():
     ap.add_argument("--per-step", action="store_true",
                     help="附带输出每 step 明细 csv（<out>.per_step.csv）")
     ap.add_argument("--trim-rollout-top", type=int, default=0, metavar="N",
-                    help="计算 rollout_time_avg_s 前剔除耗时最大的 N 个 step（默认 0；"
-                         "只影响指标 1，total_gen_throughput 仍用全部 step）")
+                    help="剔除耗时最大的 N 个 step 后再计算 rollout_time_avg_s 与 "
+                         "total_gen_throughput_tok_s（默认 0；max_gen_throughput 不受影响）")
     args = ap.parse_args()
 
     log_dir = Path(args.log_dir)
